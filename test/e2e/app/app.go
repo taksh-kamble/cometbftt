@@ -24,6 +24,7 @@ import (
 	"github.com/cometbft/cometbft/libs/protoio"
 	cryptoproto "github.com/cometbft/cometbft/proto/tendermint/crypto"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
+	"github.com/cometbft/cometbft/test/e2e/app/adaptive"
 	cmttypes "github.com/cometbft/cometbft/types"
 	"github.com/cometbft/cometbft/version"
 )
@@ -51,6 +52,8 @@ type Application struct {
 	restoreSnapshot *abci.Snapshot
 	restoreChunks   [][]byte
 	appMempool      *AppMempool
+	adaptivePolicy  *adaptive.Policy
+	currentX        uint64
 }
 
 // Config allows for the setting of high level parameters for running the e2e Application
@@ -66,7 +69,13 @@ type Config struct {
 	// RetainBlocks specifies the number of recent blocks to retain. Defaults to
 	// 0, which retains all blocks. Must be greater that PersistInterval,
 	// SnapshotInterval and EvidenceAgeHeight.
-	RetainBlocks uint64 `toml:"retain_blocks"`
+	RetainBlocks      uint64  `toml:"retain_blocks"`
+	AdaptiveRetention bool    `toml:"adaptive_retention"`
+	MinRetainBlocks   uint64  `toml:"min_retain_blocks"`
+	MaxRetainBlocks   uint64  `toml:"max_retain_blocks"`
+	LowFreePercent    float64 `toml:"low_free_percent"`
+	HighFreePercent   float64 `toml:"high_free_percent"`
+	AdjustmentStep    uint64  `toml:"adjustment_step"`
 
 	// KeyType sets the curve that will be used by validators.
 	// Options are ed25519 & secp256k1
@@ -139,14 +148,35 @@ func NewApplication(cfg *Config) (*Application, error) {
 	}
 
 	logger := log.NewTMLogger(log.NewSyncWriter(os.Stdout))
-
-	return &Application{
+	app := &Application{
 		logger:     logger,
 		state:      state,
 		snapshots:  snapshots,
 		cfg:        cfg,
 		appMempool: NewAppMempool(logger),
-	}, nil
+	}
+
+	if cfg.AdaptiveRetention {
+		app.adaptivePolicy = adaptive.NewPolicy(adaptive.PolicyConfig{
+			MinRetainBlocks: cfg.MinRetainBlocks,
+			MaxRetainBlocks: cfg.MaxRetainBlocks,
+			LowFreePercent:  cfg.LowFreePercent,
+			HighFreePercent: cfg.HighFreePercent,
+			AdjustmentStep:  cfg.AdjustmentStep,
+		})
+		app.currentX = cfg.RetainBlocks
+                app.logger.Info("adaptive policy initialized",
+    "current_x", app.currentX,
+    "min_retain_blocks", cfg.MinRetainBlocks,
+    "max_retain_blocks", cfg.MaxRetainBlocks,
+    "low_free_percent", cfg.LowFreePercent,
+    "high_free_percent", cfg.HighFreePercent,
+    "adjustment_step", cfg.AdjustmentStep,
+)
+	}
+
+	return app, nil
+
 }
 
 // Info implements ABCI.
@@ -341,7 +371,47 @@ func (app *Application) Commit(_ context.Context, _ *abci.RequestCommit) (*abci.
 		}
 	}
 	retainHeight := int64(0)
-	if app.cfg.RetainBlocks > 0 {
+
+	if app.cfg.AdaptiveRetention && app.adaptivePolicy != nil {
+		diskInfo, err := adaptive.GetDiskInfo(app.cfg.Dir)
+		if err != nil {
+			app.logger.Error("failed to measure disk space", "err", err)
+		} else {
+			previousX := app.currentX
+app.currentX = app.adaptivePolicy.Calculate(
+        app.currentX,
+        diskInfo.FreePercent,
+)
+
+if previousX != app.currentX {
+    reason := "HIGH_DISK"
+    if diskInfo.FreePercent < app.cfg.LowFreePercent {
+        reason = "LOW_DISK"
+    }
+
+    app.logger.Info(
+        "========== ADAPTIVE-X ==========",
+        "free_disk", fmt.Sprintf("%.2f%%", diskInfo.FreePercent),
+        "previous_x", previousX,
+        "new_x", app.currentX,
+        "reason", reason,
+        "height", height,
+    )
+}
+
+			if app.currentX > 0 && uint64(height) >= app.currentX {
+				retainHeight = int64(height - app.currentX + 1)
+			}
+
+			app.logger.Info(
+				"adaptive retention",
+				"height", height,
+				"free_percent", diskInfo.FreePercent,
+				"retain_blocks", app.currentX,
+				"retain_height", retainHeight,
+			)
+		}
+	} else if app.cfg.RetainBlocks > 0 {
 		retainHeight = int64(height - app.cfg.RetainBlocks + 1)
 	}
 	return &abci.ResponseCommit{

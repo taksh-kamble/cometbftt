@@ -1,0 +1,8 @@
+[node.validator]
+adaptive_retention = true
+retain_blocks = 20
+min_retain_blocks = 14
+max_retain_blocks = 50
+low_free_percent = 35.0
+high_free_percent = 40.0
+adjustment_step = 6
